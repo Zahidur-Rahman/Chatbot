@@ -7,18 +7,16 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import re
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from datetime import datetime
 
-# MCP imports for stdio transport
+# MCP imports
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
-from pydantic import AnyUrl
 
-# Set up logging
+# Set up logging for Windows compatibility
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -31,43 +29,62 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-logger.info(f"Starting postgres MCP server")
+logger.info("Starting postgres MCP server")
 logger.info(f"Python executable: {sys.executable}")
 logger.info(f"Current working directory: {os.getcwd()}")
 
-# Create MCP server for stdio transport
+# Create MCP server
 server = Server("postgres-mcp-server")
-
-class ChatResponse(BaseModel):
-    result: Optional[dict] = None
-    error: Optional[str] = None
-    tools_used: List[str] = Field(default_factory=list)
-    execution_time: Optional[float] = None
 
 @contextmanager
 def get_db_connection():
     """Get database connection with context manager"""
+    conn = None
     try:
         conn = psycopg2.connect(
             host=os.getenv("POSTGRES_HOST", "localhost"),
             database=os.getenv("POSTGRES_DB", "resturent"),
             user=os.getenv("POSTGRES_USER", "postgres"),
             password=os.getenv("POSTGRES_PASSWORD", "postgres"),
-            port=os.getenv("POSTGRES_PORT", "5432")
+            port=int(os.getenv("POSTGRES_PORT", "5432"))
         )
-        logger.info("Database connection established")
+        logger.debug("Database connection established")
         yield conn
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise
     finally:
-        if 'conn' in locals():
+        if conn:
             conn.close()
             logger.debug("Database connection closed")
 
+def validate_query(query: str) -> tuple[bool, str]:
+    """Validate SQL query for safety"""
+    query = query.strip()
+    
+    if not query:
+        return False, "Empty query"
+    
+    # Check for dangerous operations
+    dangerous_patterns = [
+        r'\bDROP\b', r'\bDELETE\b', r'\bTRUNCATE\b', 
+        r'\bALTER\b', r'\bCREATE\b', r'\bINSERT\b', 
+        r'\bUPDATE\b', r'\bGRANT\b', r'\bREVOKE\b'
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, query, re.IGNORECASE):
+            return False, f"Operation not allowed: {pattern.replace('\\b', '')}"
+    
+    # Ensure it's a SELECT statement
+    if not query.upper().strip().startswith('SELECT'):
+        return False, "Only SELECT statements are allowed"
+    
+    return True, "Valid"
+
 @server.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available tools"""
+async def list_tools() -> List[Tool]:
+    """List available tools - matching FastMCP client expectations"""
     return [
         Tool(
             name="execute_query",
@@ -84,7 +101,7 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="get_table_schema",
+            name="get_table_schema", 
             description="Get schema information for a specific table",
             inputSchema={
                 "type": "object",
@@ -107,19 +124,10 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="get_all_foreign_keys",
-            description="Get all foreign key relationships in the database",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        Tool(
             name="get_full_schema",
             description="Get full schema: tables, columns, and foreign keys",
             inputSchema={
-                "type": "object",
+                "type": "object", 
                 "properties": {},
                 "required": []
             }
@@ -127,331 +135,251 @@ async def list_tools() -> list[Tool]:
     ]
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> ChatResponse:
-    """Handle tool calls"""
+async def call_tool(name: str, arguments: dict) -> List[TextContent]:
+    """Handle tool calls and return MCP-compliant responses"""
     logger.info(f"Tool called: {name} with arguments: {arguments}")
+    
+    # Handle None or non-dict arguments
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        logger.error(f"Arguments is not a dict! Type: {type(arguments)}, Value: {arguments}")
+        return [TextContent(type="text", text=json.dumps({"error": "Arguments must be a dict."}))]
     
     try:
         if name == "execute_query":
             result = await execute_query(arguments.get("query", ""))
-            if "error" in result:
-                return ChatResponse(
-                    error=result["error"],
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-            else:
-                return ChatResponse(
-                    result=result,
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-        
         elif name == "get_table_schema":
             result = await get_table_schema(arguments.get("table_name", ""))
-            if "error" in result:
-                return ChatResponse(
-                    error=result["error"],
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-            else:
-                return ChatResponse(
-                    result=result,
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-        
         elif name == "list_tables":
             result = await list_tables()
-            if "error" in result:
-                return ChatResponse(
-                    error=result["error"],
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-            else:
-                return ChatResponse(
-                    result=result,
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-        
-        elif name == "get_all_foreign_keys":
-            result = await get_all_foreign_keys()
-            if "error" in result:
-                return ChatResponse(
-                    error=result["error"],
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-            else:
-                return ChatResponse(
-                    result=result,
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-        
         elif name == "get_full_schema":
             result = await get_full_schema()
-            if "error" in result:
-                return ChatResponse(
-                    error=result["error"],
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-            else:
-                return ChatResponse(
-                    result=result,
-                    tools_used=["sql_generator", "database"],
-                    execution_time=asyncio.get_event_loop().time() - start_time
-                )
-        
         else:
-            error_msg = f"Unknown tool: {name}"
-            logger.error(error_msg)
-            return ChatResponse(
-                error=error_msg,
-                tools_used=["sql_generator", "database"],
-                execution_time=asyncio.get_event_loop().time() - start_time
-            )
-    
+            result = {"error": f"Unknown tool: {name}"}
+        
+        # Return MCP-compliant response
+        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        
     except Exception as e:
         error_msg = f"Error executing tool {name}: {str(e)}"
-        logger.error(error_msg)
-        return ChatResponse(
-            error=error_msg,
-            tools_used=["sql_generator", "database"],
-            execution_time=asyncio.get_event_loop().time() - start_time
-        )
+        logger.error(error_msg, exc_info=True)
+        return [TextContent(type="text", text=json.dumps({"error": error_msg}))]
 
-async def execute_query(query: str) -> str:
-    """Execute a SQL query and return results"""
-    logger.info(f"Executing query: {query[:100]}...")  # Log first 100 chars
+async def execute_query(query: str) -> Dict[str, Any]:
+    """Execute a SQL query and return results - matching FastMCP client expectations"""
+    logger.info(f"Executing query: {query[:100]}...")
     
     try:
-        # Basic input validation
-        query = query.strip()
-        if not query:
-            return json.dumps({"error": "Empty query"})
-        
-        # Prevent dangerous operations (basic protection)
-        dangerous_keywords = ['DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE']
-        query_upper = query.upper()
-        for keyword in dangerous_keywords:
-            if keyword in query_upper:
-                error_msg = f"Operation not allowed: {keyword}"
-                logger.warning(f"Blocked dangerous query: {query[:50]}...")
-                return json.dumps({"error": error_msg})
+        # Validate query
+        is_valid, message = validate_query(query)
+        if not is_valid:
+            return {"error": message}
         
         # Execute query
         with get_db_connection() as conn:
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute(query)
-            
-            if query_upper.startswith('SELECT'):
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(query)
                 results = cursor.fetchall()
-                # Convert to regular dict for JSON serialization
+                
+                # Convert to serializable format
                 data = [dict(row) for row in results]
+                
+                # Match the expected format from FastMCP client
                 response = {
                     "columns": list(data[0].keys()) if data else [],
-                    "rows": [list(row.values()) for row in data],
-                    "count": len(data)
+                    "rows": data,
+                    "row_count": len(data),  # FastMCP client expects 'row_count'
+                    "query": query
                 }
+                
                 logger.info(f"Query returned {len(data)} rows")
-                return response
-            else:
-                conn.commit()
-                response = {
-                    "message": f"Query executed successfully. Rows affected: {cursor.rowcount}",
-                    "rows_affected": cursor.rowcount
-                }
                 return response
                 
     except psycopg2.Error as e:
         error_msg = f"Database error: {str(e)}"
         logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        return {"error": error_msg}
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
-        logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        logger.error(error_msg, exc_info=True)
+        return {"error": error_msg}
 
-async def get_table_schema(table_name: str) -> str:
-    """Get schema information for a specific table"""
+async def get_table_schema(table_name: str) -> Dict[str, Any]:
+    """Get schema information for a specific table - matching FastMCP client expectations"""
     logger.info(f"Getting schema for table: {table_name}")
     
     try:
         if not table_name:
-            return json.dumps({"error": "Table name is required"})
+            return {"error": "Table name is required"}
         
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get column information
-            query = """
-                SELECT 
-                    column_name, 
-                    data_type, 
-                    is_nullable, 
-                    column_default,
-                    character_maximum_length,
-                    numeric_precision,
-                    numeric_scale
-                FROM information_schema.columns
-                WHERE table_name = %s AND table_schema = 'public'
-                ORDER BY ordinal_position;
-            """
-            cursor.execute(query, (table_name,))
-            columns = cursor.fetchall()
-            
-            if not columns:
-                return json.dumps({"error": f"Table '{table_name}' not found"})
-            
-            # Format schema information
-            schema_info = {
-                "table_name": table_name,
-                "columns": []
-            }
-            
-            for col in columns:
-                column_info = {
-                    "name": col[0],
-                    "type": col[1],
-                    "nullable": col[2] == 'YES',
-                    "default": col[3],
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get column information
+                query = """
+                    SELECT 
+                        column_name, 
+                        data_type, 
+                        is_nullable, 
+                        column_default,
+                        character_maximum_length,
+                        numeric_precision,
+                        numeric_scale,
+                        ordinal_position
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND table_schema = 'public'
+                    ORDER BY ordinal_position;
+                """
+                cursor.execute(query, (table_name,))
+                columns = cursor.fetchall()
+                
+                if not columns:
+                    return {"error": f"Table '{table_name}' not found"}
+                
+                # Get primary keys
+                pk_query = """
+                    SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu 
+                        ON tc.constraint_name = kcu.constraint_name
+                    WHERE tc.table_name = %s 
+                        AND tc.constraint_type = 'PRIMARY KEY'
+                        AND tc.table_schema = 'public';
+                """
+                cursor.execute(pk_query, (table_name,))
+                primary_keys = [row['column_name'] for row in cursor.fetchall()]
+                
+                # Format to match FastMCP client expectations
+                response = {
+                    "table_name": table_name,
+                    "columns": [dict(col) for col in columns],
+                    "primary_keys": primary_keys
                 }
                 
-                # Add length/precision info if available
-                if col[4]:  # character_maximum_length
-                    column_info["max_length"] = col[4]
-                if col[5]:  # numeric_precision
-                    column_info["precision"] = col[5]
-                if col[6]:  # numeric_scale
-                    column_info["scale"] = col[6]
+                logger.info(f"Schema retrieved for table {table_name}: {len(columns)} columns")
+                return response
                 
-                schema_info["columns"].append(column_info)
-            
-            logger.info(f"Schema retrieved for table {table_name}: {len(columns)} columns")
-            return schema_info
-            
     except psycopg2.Error as e:
         error_msg = f"Database error getting schema: {str(e)}"
         logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        return {"error": error_msg}
     except Exception as e:
         error_msg = f"Unexpected error getting schema: {str(e)}"
-        logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        logger.error(error_msg, exc_info=True)
+        return {"error": error_msg}
 
-async def list_tables() -> str:
-    """List all tables in the database"""
+async def list_tables() -> Dict[str, Any]:
+    """List all tables in the database - matching FastMCP client expectations"""
     logger.info("Listing tables")
     
     try:
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get table names and row counts
-            query = """
-                SELECT 
-                    t.table_name,
-                    COALESCE(s.n_tup_ins - s.n_tup_del, 0) as estimated_rows
-                FROM information_schema.tables t
-                LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name
-                WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
-                ORDER BY t.table_name;
-            """
-            cursor.execute(query)
-            tables = cursor.fetchall()
-            
-            table_info = {
-                "tables": [
-                    {
-                        "name": table[0],
-                        "estimated_rows": table[1] if table[1] is not None else 0
-                    }
-                    for table in tables
-                ],
-                "count": len(tables)
-            }
-            
-            logger.info(f"Listed {len(tables)} tables")
-            return table_info
-            
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get table names and row counts - matching the query from FastMCP client
+                query = """
+                    SELECT 
+                        t.table_name,
+                        COALESCE(s.n_tup_ins - s.n_tup_del, 0) as estimated_rows,
+                        obj_description(c.oid) as table_comment
+                    FROM information_schema.tables t
+                    LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name
+                    LEFT JOIN pg_class c ON c.relname = t.table_name
+                    WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                    ORDER BY t.table_name;
+                """
+                cursor.execute(query)
+                tables = cursor.fetchall()
+                
+                # Match the expected format from FastMCP client
+                response = {
+                    "tables": [
+                        {
+                            "name": table['table_name'],
+                            "estimated_rows": table['estimated_rows'] if table['estimated_rows'] is not None else 0,
+                            "comment": table['table_comment']
+                        }
+                        for table in tables
+                    ],
+                    "count": len(tables)
+                }
+                
+                logger.info(f"Listed {len(tables)} tables")
+                return response
+                
     except psycopg2.Error as e:
         error_msg = f"Database error listing tables: {str(e)}"
         logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        return {"error": error_msg}
     except Exception as e:
         error_msg = f"Unexpected error listing tables: {str(e)}"
-        logger.error(error_msg)
-        return json.dumps({"error": error_msg})
+        logger.error(error_msg, exc_info=True)
+        return {"error": error_msg}
 
-async def get_all_foreign_keys() -> str:
-    """Get all foreign key relationships in the database"""
-    logger.info("Getting all foreign keys")
-    query = """
-        SELECT
-            tc.table_name AS table_name,
-            kcu.column_name AS column_name,
-            ccu.table_name AS foreign_table_name,
-            ccu.column_name AS foreign_column_name
-        FROM
-            information_schema.table_constraints AS tc
-            JOIN information_schema.key_column_usage AS kcu
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage AS ccu
-              ON ccu.constraint_name = tc.constraint_name
-              AND ccu.table_schema = tc.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public';
-    """
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(query)
-            fks = cursor.fetchall()
-    return json.dumps({"foreign_keys": fks}, indent=2)
-
-async def get_full_schema() -> str:
-    """Get full schema: tables, columns, and foreign keys"""
+async def get_full_schema() -> Dict[str, Any]:
+    """Get full schema: tables, columns, and foreign keys - matching FastMCP client expectations"""
     logger.info("Getting full schema")
-    # Get tables and columns
-    with get_db_connection() as conn:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-            ORDER BY table_name;
-        """)
-        tables = [row['table_name'] for row in cursor.fetchall()]
-        schema = {}
-        for table in tables:
-            cursor.execute("""
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_name = %s AND table_schema = 'public'
-                ORDER BY ordinal_position;
-            """, (table,))
-            schema[table] = cursor.fetchall()
-    # Get foreign keys
-    fks = json.loads(await get_all_foreign_keys())['foreign_keys']
-    return json.dumps({"tables": schema, "foreign_keys": fks}, indent=2)
+    
+    try:
+        # Get tables first
+        tables_result = await list_tables()
+        if "error" in tables_result:
+            return tables_result
+        
+        # Initialize the schema structure to match FastMCP client expectations
+        full_schema = {"tables": {}}
+        
+        # Get detailed schema for each table
+        for table_info in tables_result["tables"]:
+            table_name = table_info["name"]
+            schema_result = await get_table_schema(table_name)
+            
+            if "error" not in schema_result:
+                # Store the columns data as expected by FastMCP client
+                full_schema["tables"][table_name] = schema_result["columns"]
+        
+        logger.info(f"Full schema retrieved with {len(full_schema['tables'])} tables")
+        return full_schema
+        
+    except Exception as e:
+        error_msg = f"Error getting full schema: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": error_msg}
+
+async def test_database_connection():
+    """Test database connection on startup"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT version();")
+                version = cursor.fetchone()[0]
+                logger.info(f"✓ Connected to PostgreSQL: {version}")
+                
+                # Test basic functionality
+                cursor.execute("""
+                    SELECT COUNT(*) as table_count 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                """)
+                table_count = cursor.fetchone()[0]
+                logger.info(f"✓ Found {table_count} tables in public schema")
+                return True
+    except Exception as e:
+        logger.error(f"✗ Database connection test failed: {e}")
+        return False
 
 async def main():
     """Main function to run the MCP server"""
-    logger.info("Starting MCP server with stdio transport...")
+    logger.info("Starting PostgreSQL MCP server with stdio transport...")
     
     try:
         # Test database connection on startup
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT version();")
-            version = cursor.fetchone()[0]
-            logger.info(f"Connected to PostgreSQL: {version}")
+        if not await test_database_connection():
+            logger.error("Database connection test failed. Please check your configuration.")
+            sys.exit(1)
         
-        # Run the server
+        logger.info("✓ All systems ready - starting MCP server")
+        
+        # Run the server with stdio transport
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,
@@ -460,12 +388,22 @@ async def main():
             )
             
     except KeyboardInterrupt:
-        logger.info("MCP server stopped by user")
+        logger.info("MCP server interrupted by user")
     except Exception as e:
-        logger.error(f"MCP server error: {e}")
-        raise
+        logger.error(f"MCP server error: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         logger.info("MCP server stopped")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Windows compatibility: handle event loop properly
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Server interrupted by user")
+    except Exception as e:
+        logger.error(f"Server failed to start: {e}", exc_info=True)
+        sys.exit(1)

@@ -1,21 +1,25 @@
 import logging
 import os
 import asyncio
-import subprocess
-import sys
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from langchain_mistralai import ChatMistralAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from contextlib import asynccontextmanager
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import re
-import json
+import time
 from fastapi.responses import FileResponse
+from collections import deque
+import uuid
+
+# FastMCP imports
+from fastmcp import FastMCP
 
 # Set up logging
 logging.basicConfig(
@@ -26,16 +30,58 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Database configuration with validation
+# Conversation Memory Manager
+class ConversationMemory:
+    def __init__(self, max_conversations: int = 30):
+        self.max_conversations = max_conversations
+        self.conversations = {}  # session_id -> deque of messages
+    
+    def add_message(self, session_id: str, role: str, content: str, sql_query: str = None):
+        """Add a message to conversation history"""
+        if session_id not in self.conversations:
+            self.conversations[session_id] = deque(maxlen=self.max_conversations)
+        
+        message = {
+            "role": role,
+            "content": content,
+            "timestamp": time.time(),
+            "sql_query": sql_query
+        }
+        
+        self.conversations[session_id].append(message)
+    
+    def get_conversation_context(self, session_id: str, last_n: int = 10) -> List[Dict]:
+        """Get last N messages for context"""
+        if session_id not in self.conversations:
+            return []
+        
+        messages = list(self.conversations[session_id])
+        return messages[-last_n:] if len(messages) > last_n else messages
+    
+    def get_formatted_context(self, session_id: str, last_n: int = 10) -> str:
+        """Get formatted conversation context for LLM"""
+        context = self.get_conversation_context(session_id, last_n)
+        if not context:
+            return ""
+        
+        formatted = "\n--- Previous Conversation Context ---\n"
+        for msg in context:
+            formatted += f"{msg['role'].upper()}: {msg['content']}\n"
+            if msg.get('sql_query'):
+                formatted += f"SQL: {msg['sql_query']}\n"
+        formatted += "--- End Context ---\n"
+        
+        return formatted
+
+# Database configuration
 class DatabaseConfig:
     def __init__(self):
         self.host = os.getenv("POSTGRES_HOST", "localhost")
-        self.database = os.getenv("POSTGRES_DB", "resturent")  # Fixed typo
+        self.database = os.getenv("POSTGRES_DB", "resturent")
         self.user = os.getenv("POSTGRES_USER", "postgres")
         self.password = os.getenv("POSTGRES_PASSWORD", "postgres")
         self.port = int(os.getenv("POSTGRES_PORT", "5432"))
         
-        # Validate required environment variables
         if not self.password or self.password == "postgres":
             logger.warning("Using default password. Consider setting POSTGRES_PASSWORD")
     
@@ -50,80 +96,243 @@ class DatabaseConfig:
 
 db_config = DatabaseConfig()
 
-# MCP client management
-class MCPClientManager:
+# FastMCP Client Manager
+class FastMCPManager:
     def __init__(self):
-        self.client = None
-        self.process = None
-        self.max_retries = 3
-        self.retry_delay = 2
+        self.mcp = None
+        self.is_initialized = False
     
     async def initialize(self):
-        """Initialize MCP client with retry logic"""
-        for attempt in range(self.max_retries):
-            try:
-                logger.info(f"Initializing MCP client (attempt {attempt + 1})")
-                await self._start_mcp_server()
-                logger.info("MCP client initialized successfully")
+        """Initialize FastMCP client"""
+        try:
+            logger.info("Initializing FastMCP client...")
+            
+            # Create FastMCP instance with database tools
+            self.mcp = FastMCP("PostgreSQL Database Tools")
+            
+            # Register database tools
+            await self._register_tools()
+            
+            # Directly test the tool registration
+            result = await self.mcp.run_tool("list_tables", {})
+            if "error" not in result:
+                self.is_initialized = True
+                logger.info("FastMCP client initialized successfully")
                 return True
-            except Exception as e:
-                logger.warning(f"MCP initialization attempt {attempt + 1} failed: {e}")
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(self.retry_delay)
-                else:
-                    logger.error("MCP client initialization failed after all attempts")
-        return False
+            else:
+                logger.error(f"FastMCP test failed: {result}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"FastMCP initialization error: {e}")
+            return False
     
-    async def _start_mcp_server(self):
-        """Start MCP server process"""
-        if self.process is None or self.process.poll() is not None:
+    async def _register_tools(self):
+        """Register database tools with FastMCP"""
+        
+        @self.mcp.tool()
+        async def list_tables() -> Dict[str, Any]:
+            """List all tables in the database"""
             try:
-                cmd = [sys.executable, "postgres_server.py"]
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
-                    text=True,
-                    bufsize=1
-                )
-                
-                # Wait for server to start
-                await asyncio.sleep(3)
-                
-                # Check if process is still running
-                if self.process.poll() is not None:
-                    stdout, stderr = self.process.communicate()
-                    raise Exception(f"MCP server died. stdout: {stdout}, stderr: {stderr}")
-                
-                logger.info("MCP server process started successfully")
+                with psycopg2.connect(**db_config.get_connection_params()) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute("""
+                            SELECT 
+                                t.table_name,
+                                COALESCE(s.n_tup_ins - s.n_tup_del, 0) as estimated_rows,
+                                obj_description(c.oid) as table_comment
+                            FROM information_schema.tables t
+                            LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name
+                            LEFT JOIN pg_class c ON c.relname = t.table_name
+                            WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                            ORDER BY t.table_name;
+                        """)
+                        tables = cursor.fetchall()
+                        
+                        return {
+                            "tables": [
+                                {
+                                    "name": table['table_name'],
+                                    "estimated_rows": table['estimated_rows'] if table['estimated_rows'] is not None else 0,
+                                    "comment": table['table_comment']
+                                }
+                                for table in tables
+                            ],
+                            "count": len(tables)
+                        }
             except Exception as e:
-                logger.error(f"Failed to start MCP server: {e}")
-                self.process = None
-                raise
+                return {"error": f"Database error: {str(e)}"}
+        
+        @self.mcp.tool()
+        async def execute_query(query: str) -> Dict[str, Any]:
+            """Execute a SQL SELECT query and return results"""
+            try:
+                # Validate query
+                is_valid, message = self._validate_query(query)
+                if not is_valid:
+                    return {"error": message}
+                
+                with psycopg2.connect(**db_config.get_connection_params()) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute(query)
+                        results = cursor.fetchall()
+                        
+                        data = [dict(row) for row in results]
+                        
+                        return {
+                            "columns": list(data[0].keys()) if data else [],
+                            "rows": data,
+                            "row_count": len(data),
+                            "query": query
+                        }
+            except Exception as e:
+                return {"error": f"Database error: {str(e)}"}
+        
+        @self.mcp.tool()
+        async def get_table_schema(table_name: str) -> Dict[str, Any]:
+            """Get schema information for a specific table"""
+            try:
+                with psycopg2.connect(**db_config.get_connection_params()) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        # Get column information
+                        cursor.execute("""
+                            SELECT 
+                                column_name, 
+                                data_type, 
+                                is_nullable, 
+                                column_default,
+                                character_maximum_length,
+                                numeric_precision,
+                                numeric_scale,
+                                ordinal_position
+                            FROM information_schema.columns
+                            WHERE table_name = %s AND table_schema = 'public'
+                            ORDER BY ordinal_position;
+                        """, (table_name,))
+                        columns = cursor.fetchall()
+                        
+                        if not columns:
+                            return {"error": f"Table '{table_name}' not found"}
+                        
+                        # Get primary keys
+                        cursor.execute("""
+                            SELECT kcu.column_name
+                            FROM information_schema.table_constraints tc
+                            JOIN information_schema.key_column_usage kcu 
+                                ON tc.constraint_name = kcu.constraint_name
+                            WHERE tc.table_name = %s 
+                                AND tc.constraint_type = 'PRIMARY KEY'
+                                AND tc.table_schema = 'public';
+                        """, (table_name,))
+                        primary_keys = [row['column_name'] for row in cursor.fetchall()]
+                        
+                        return {
+                            "table_name": table_name,
+                            "columns": [dict(col) for col in columns],
+                            "primary_keys": primary_keys
+                        }
+            except Exception as e:
+                return {"error": f"Database error: {str(e)}"}
+        
+        @self.mcp.tool()
+        async def get_full_schema() -> Dict[str, Any]:
+            """Get full schema: tables, columns, and foreign keys"""
+            try:
+                tables_result = await list_tables()
+                if "error" in tables_result:
+                    return tables_result
+                
+                full_schema = {"tables": {}}
+                
+                for table_info in tables_result["tables"]:
+                    table_name = table_info["name"]
+                    schema_result = await get_table_schema(table_name)
+                    
+                    if "error" not in schema_result:
+                        full_schema["tables"][table_name] = schema_result["columns"]
+                
+                return full_schema
+            except Exception as e:
+                return {"error": f"Error getting full schema: {str(e)}"}
     
-    async def cleanup(self):
-        """Clean up MCP resources"""
-        if self.process:
-            try:
-                self.process.terminate()
-                await asyncio.sleep(1)
-                if self.process.poll() is None:
-                    self.process.kill()
-                logger.info("MCP server process terminated")
-            except Exception as e:
-                logger.error(f"Error cleaning up MCP process: {e}")
+    def _validate_query(self, query: str) -> tuple[bool, str]:
+        """Validate SQL query for safety"""
+        query = query.strip()
+        
+        if not query:
+            return False, "Empty query"
+        
+        dangerous_patterns = [
+            r'\bDROP\b', r'\bDELETE\b', r'\bTRUNCATE\b', 
+            r'\bALTER\b', r'\bCREATE\b', r'\bINSERT\b', 
+            r'\bUPDATE\b', r'\bGRANT\b', r'\bREVOKE\b'
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                return False, f"Operation not allowed: {pattern.replace('\\b', '')}"
+        
+        if not query.upper().strip().startswith('SELECT'):
+            return False, "Only SELECT statements are allowed"
+        
+        return True, "Valid"
+    
+    async def list_tables(self):
+        """Call list_tables tool"""
+        if not self.is_initialized:
+            return {"error": "FastMCP not initialized"}
+        
+        try:
+            # Call the registered tool
+            result = await self.mcp.run_tool("list_tables", {})
+            return result
+        except Exception as e:
+            return {"error": f"FastMCP tool error: {str(e)}"}
+    
+    async def execute_query(self, query: str):
+        """Call execute_query tool"""
+        if not self.is_initialized:
+            return {"error": "FastMCP not initialized"}
+        
+        try:
+            result = await self.mcp.run_tool("execute_query", {"query": query})
+            return result
+        except Exception as e:
+            return {"error": f"FastMCP tool error: {str(e)}"}
+    
+    async def get_table_schema(self, table_name: str):
+        """Call get_table_schema tool"""
+        if not self.is_initialized:
+            return {"error": "FastMCP not initialized"}
+        
+        try:
+            result = await self.mcp.run_tool("get_table_schema", {"table_name": table_name})
+            return result
+        except Exception as e:
+            return {"error": f"FastMCP tool error: {str(e)}"}
+    
+    async def get_full_schema(self):
+        """Call get_full_schema tool"""
+        if not self.is_initialized:
+            return {"error": "FastMCP not initialized"}
+        
+        try:
+            result = await self.mcp.run_tool("get_full_schema", {})
+            return result
+        except Exception as e:
+            return {"error": f"FastMCP tool error: {str(e)}"}
 
-mcp_manager = MCPClientManager()
+# Initialize managers
+mcp_manager = FastMCPManager()
+conversation_memory = ConversationMemory()
 
-# Database operations with improved error handling
+# Database operations
 class DatabaseManager:
     def __init__(self, config: DatabaseConfig):
         self.config = config
-        self._connection_cache = None
     
     def get_connection(self):
-        """Get database connection with connection pooling"""
+        """Get database connection"""
         try:
             return psycopg2.connect(**self.config.get_connection_params())
         except psycopg2.Error as e:
@@ -148,7 +357,6 @@ class DatabaseManager:
         if not query:
             return False, "Empty query"
         
-        # Check for dangerous operations
         dangerous_patterns = [
             r'\bDROP\b', r'\bDELETE\b', r'\bTRUNCATE\b', 
             r'\bALTER\b', r'\bCREATE\b', r'\bINSERT\b', 
@@ -159,7 +367,6 @@ class DatabaseManager:
             if re.search(pattern, query, re.IGNORECASE):
                 return False, f"Operation not allowed: {pattern.replace('\\b', '')}"
         
-        # Ensure it's a SELECT statement
         if not query.upper().strip().startswith('SELECT'):
             return False, "Only SELECT statements are allowed"
         
@@ -176,20 +383,13 @@ class DatabaseManager:
                 with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                     cursor.execute(query)
                     
-                    if query.strip().upper().startswith('SELECT'):
-                        rows = cursor.fetchall()
-                        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                        return {
-                            "columns": columns,
-                            "rows": [dict(row) for row in rows],
-                            "row_count": len(rows)
-                        }
-                    else:
-                        conn.commit()
-                        return {
-                            "message": f"Query executed successfully. Rows affected: {cursor.rowcount}",
-                            "rows_affected": cursor.rowcount
-                        }
+                    rows = cursor.fetchall()
+                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                    return {
+                        "columns": columns,
+                        "rows": [dict(row) for row in rows],
+                        "row_count": len(rows)
+                    }
         
         except psycopg2.Error as e:
             logger.error(f"Database query error: {e}")
@@ -197,107 +397,38 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Unexpected query error: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
-    
-    async def get_table_schema(self, table_name: str) -> Dict[str, Any]:
-        """Get schema information for a specific table"""
-        try:
-            # Validate table name to prevent SQL injection
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
-                return {"error": "Invalid table name"}
-            
-            query = """
-                SELECT column_name, data_type, is_nullable, column_default,
-                       character_maximum_length, numeric_precision, numeric_scale
-                FROM information_schema.columns
-                WHERE table_name = %s AND table_schema = 'public'
-                ORDER BY ordinal_position
-            """
-            
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(query, (table_name,))
-                    columns = cursor.fetchall()
-                    
-                    if not columns:
-                        return {"error": f"Table '{table_name}' not found"}
-                    
-                    return {
-                        "table_name": table_name,
-                        "columns": [dict(col) for col in columns]
-                    }
-        
-        except Exception as e:
-            logger.error(f"Schema retrieval error: {e}")
-            return {"error": f"Error retrieving schema: {str(e)}"}
-    
-    async def list_tables(self) -> Dict[str, Any]:
-        """List all tables in the database"""
-        try:
-            query = """
-                SELECT table_name, table_type
-                FROM information_schema.tables
-                WHERE table_schema = 'public'
-                ORDER BY table_name
-            """
-            
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(query)
-                    tables = cursor.fetchall()
-                    return {"tables": [dict(table) for table in tables]}
-        
-        except Exception as e:
-            logger.error(f"List tables error: {e}")
-            return {"error": f"Error listing tables: {str(e)}"}
-    
-    async def get_all_schemas(self) -> Dict[str, List[str]]:
-        """Get schema information for all tables"""
-        try:
-            tables_result = await self.list_tables()
-            if "error" in tables_result:
-                return {}
-            
-            schemas = {}
-            for table in tables_result["tables"]:
-                table_name = table["table_name"]
-                schema_result = await self.get_table_schema(table_name)
-                if "error" not in schema_result:
-                    schemas[table_name] = [
-                        f"{col['column_name']} ({col['data_type']})"
-                        for col in schema_result["columns"]
-                    ]
-            
-            return schemas
-            
-        except Exception as e:
-            logger.error(f"Error getting all schemas: {e}")
-            return {}
 
 db_manager = DatabaseManager(db_config)
 
-# Pydantic models with improved validation
+# Pydantic models
 class ChatMessage(BaseModel):
     role: str = Field(..., pattern="^(user|assistant|system)$")
     content: str = Field(..., min_length=1, max_length=10000)
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
+    session_id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
     conversation_history: Optional[List[ChatMessage]] = Field(default_factory=list)
 
 class ChatResponse(BaseModel):
     response: str
+    session_id: str
     sql_query: Optional[str] = None
     tools_used: List[str] = Field(default_factory=list)
     execution_time: Optional[float] = None
+    conversation_context_used: bool = False
 
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=5000)
 
-# Enhanced SQL query generation
+# SQL Generator
 class SQLGenerator:
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
         self.model = None
+        self._schema_cache = {}
+        self._cache_expiry = 300
+        self._last_cache_update = 0
     
     def get_model(self):
         """Get or create Mistral model"""
@@ -308,18 +439,94 @@ class SQLGenerator:
             self.model = ChatMistralAI(
                 model="mistral-large-2407",
                 api_key=api_key,
-                temperature=0.1  # Low temperature for more deterministic SQL generation
+                temperature=0.1
             )
         return self.model
     
-    async def generate_sql(self, user_message: str, conversation_history: List[ChatMessage] = None) -> str:
-        """Generate SQL query from natural language"""
+    async def get_cached_schemas(self):
+        """Get schemas with caching via FastMCP"""
+        current_time = time.time()
+        
+        if (current_time - self._last_cache_update) > self._cache_expiry:
+            # Try to get schema via FastMCP first
+            result = await mcp_manager.get_full_schema()
+            if "error" not in result and "tables" in result:
+                schemas = {}
+                tables_data = result.get("tables", {})
+                for table_name, columns in tables_data.items():
+                    schemas[table_name] = [
+                        f"{col['column_name']} ({col['data_type']})"
+                        for col in columns
+                    ]
+                self._schema_cache = schemas
+            else:
+                # Fallback to direct database access
+                self._schema_cache = await self._get_schemas_direct()
+            
+            self._last_cache_update = current_time
+            
+        return self._schema_cache
+    
+    async def _get_schemas_direct(self):
+        """Fallback method to get schemas directly from database"""
         try:
+            with db_manager.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                    """)
+                    tables = cursor.fetchall()
+                    
+                    schemas = {}
+                    for table in tables:
+                        table_name = table['table_name']
+                        cursor.execute("""
+                            SELECT column_name, data_type 
+                            FROM information_schema.columns 
+                            WHERE table_name = %s AND table_schema = 'public'
+                            ORDER BY ordinal_position
+                        """, (table_name,))
+                        columns = cursor.fetchall()
+                        schemas[table_name] = [
+                            f"{col['column_name']} ({col['data_type']})"
+                            for col in columns
+                        ]
+                    
+                    return schemas
+        except Exception as e:
+            logger.error(f"Error getting schemas directly: {e}")
+            return {}
+    
+    async def generate_sql(self, user_message: str, session_id: str, conversation_history: List[ChatMessage] = None) -> tuple[str, bool]:
+        """Generate SQL query with conversation context"""
+        try:
+            # Get conversation context
+            context = conversation_memory.get_formatted_context(session_id, last_n=10)
+            context_used = bool(context)
+            
             # Get schema information
-            schemas = await self.db_manager.get_all_schemas()
+            schemas = await self.get_cached_schemas()
             
             if not schemas:
-                return "-- Error: Could not retrieve database schema"
+                return "I couldn't retrieve the database structure. Please check the database connection.", False
+            
+            # Check if this is a database question
+            db_keywords = ['select', 'table', 'database', 'query', 'data', 'show', 'find', 'get', 'list', 'count', 'sum', 'average', 'group', 'order', 'where']
+            if not any(keyword in user_message.lower() for keyword in db_keywords):
+                # General conversation with context
+                model = self.get_model()
+                messages = [
+                    SystemMessage(content="You are a helpful AI assistant. Use the conversation context to provide relevant responses.")
+                ]
+                
+                if context:
+                    messages.append(SystemMessage(content=context))
+                
+                messages.append(HumanMessage(content=user_message))
+                response = await model.ainvoke(messages)
+                return response.content, context_used
             
             # Create schema description
             schema_text = "\n".join([
@@ -327,53 +534,52 @@ class SQLGenerator:
                 for table, columns in schemas.items()
             ])
             
-            # Create enhanced prompt
+            # Enhanced prompt with conversation context
             system_prompt = f"""You are an expert PostgreSQL query generator. Your task is to convert natural language requests into syntactically correct SELECT queries.
 
 IMPORTANT RULES:
 1. ONLY generate SELECT statements - never use DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, TRUNCATE
 2. Output ONLY the SQL query - no explanations, no markdown, no code blocks
 3. Use proper PostgreSQL syntax
-4. If the request cannot be fulfilled with a SELECT query, respond with: "-- Operation not allowed"
-5. Use table and column names exactly as provided in the schema
+4. Use table and column names exactly as provided in the schema
+5. Consider the conversation context when generating queries
+6. If the question is not database-related, respond conversationally
 
 DATABASE SCHEMA:
 {schema_text}
+
+{context if context else ""}
 
 Generate a SELECT query for the following request."""
 
             messages = [SystemMessage(content=system_prompt)]
             
-            # Add conversation history if provided
+            # Add recent conversation history
             if conversation_history:
-                for msg in conversation_history[-5:]:  # Last 5 messages for context
+                for msg in conversation_history[-5:]:
                     if msg.role == "user":
-                        messages.append(HumanMessage(content=f"Previous request: {msg.content}"))
+                        messages.append(HumanMessage(content=msg.content))
+                    elif msg.role == "assistant":
+                        messages.append(AIMessage(content=msg.content))
             
             messages.append(HumanMessage(content=f"Request: {user_message}"))
             
             model = self.get_model()
             response = await model.ainvoke(messages)
             
-            print("=== RAW LLM OUTPUT ===")
-            print(response.content)
-            print("=== END RAW LLM OUTPUT ===")
+            logger.info(f"Raw LLM response: {response.content[:200]}...")
             
             # Clean up the response
             sql_query = response.content.strip()
-            
-            # Remove any markdown code blocks
             sql_query = re.sub(r'```sql\s*', '', sql_query)
             sql_query = re.sub(r'```\s*', '', sql_query)
-            
-            # Remove common prefixes
             sql_query = re.sub(r'^(SQL|Query):\s*', '', sql_query, flags=re.IGNORECASE)
             
-            return sql_query
+            return sql_query, context_used
             
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
-            return f"-- Error generating SQL: {str(e)}"
+            return f"I encountered an error while processing your request: {str(e)}", False
 
 sql_generator = SQLGenerator(db_manager)
 
@@ -384,14 +590,17 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Starting application...")
         
-        # Test database connection
         if await db_manager.test_connection():
             logger.info("Database connection successful")
         else:
             logger.warning("Database connection failed - some features may not work")
         
-        # Initialize MCP (optional)
-        await mcp_manager.initialize()
+        # Initialize FastMCP
+        mcp_initialized = await mcp_manager.initialize()
+        if mcp_initialized:
+            logger.info("FastMCP client initialized successfully")
+        else:
+            logger.warning("FastMCP client initialization failed - falling back to direct DB access")
         
         logger.info("Application startup completed")
         yield
@@ -402,14 +611,13 @@ async def lifespan(app: FastAPI):
     
     finally:
         logger.info("Shutting down application...")
-        await mcp_manager.cleanup()
         logger.info("Application shutdown completed")
 
 # FastAPI application
 app = FastAPI(
-    title="Restaurant Database Chatbot API",
-    description="AI-powered chatbot for querying restaurant database",
-    version="2.0.0",
+    title="Chatbot with FastMCP",
+    description="AI-powered chatbot with conversation memory and FastMCP for querying restaurant database",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -425,152 +633,366 @@ app.add_middleware(
 # API endpoints
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Main chat endpoint for natural language to SQL conversion"""
-    start_time = asyncio.get_event_loop().time()
+    """Enhanced chat endpoint with conversation memory and FastMCP"""
+    start_time = time.time()
     
     try:
-        logger.info(f"Processing chat request: {request.message[:100]}...")
+        session_id = request.session_id or str(uuid.uuid4())
+        logger.info(f"Processing chat request for session {session_id}: {request.message[:100]}...")
         
-        # Generate SQL query
-        sql_query = await sql_generator.generate_sql(
+        # Add user message to conversation memory
+        conversation_memory.add_message(session_id, "user", request.message)
+        
+        # Generate response with conversation context
+        llm_response, context_used = await sql_generator.generate_sql(
             request.message, 
+            session_id,
             request.conversation_history
         )
         
-        if sql_query.startswith("-- Error") or sql_query.startswith("-- Operation not allowed"):
+        # If the response looks like a SQL query, execute it
+        if llm_response.strip().upper().startswith("SELECT"):
+            # Try FastMCP first, then fallback to direct execution
+            result = await mcp_manager.execute_query(llm_response)
+            
+            if "error" in result:
+                # Fallback to direct database execution
+                result = await db_manager.execute_query(llm_response)
+            
+            if "error" in result:
+                response_text = f"Query error: {result['error']}"
+                tools_used = ["sql_generator", "database_error"]
+            else:
+                if result.get("rows"):
+                    response_text = f"Found {result.get('row_count', len(result.get('rows', [])))} results:\n\n"
+                    response_text += json.dumps(result, indent=2, default=str)
+                else:
+                    response_text = "No results found for your query."
+                
+                tools_used = ["sql_generator", "fastmcp" if mcp_manager.is_initialized else "database"]
+            
+            # Add assistant response to memory
+            conversation_memory.add_message(session_id, "assistant", response_text, llm_response)
+            
             return ChatResponse(
-                response=sql_query,
-                sql_query=sql_query,
-                tools_used=[],
-                execution_time=asyncio.get_event_loop().time() - start_time
-            )
-        
-        # Execute the query
-        result = await db_manager.execute_query(sql_query)
-        
-        if "error" in result:
-            return ChatResponse(
-                response=result["error"],
-                sql_query=sql_query,
-                tools_used=["sql_generator", "database"],
-                execution_time=asyncio.get_event_loop().time() - start_time
+                response=response_text,
+                session_id=session_id,
+                sql_query=llm_response,
+                tools_used=tools_used,
+                execution_time=time.time() - start_time,
+                conversation_context_used=context_used
             )
         else:
-            # Return only the result as JSON string
+            # Normal conversation response
+            conversation_memory.add_message(session_id, "assistant", llm_response)
+            
             return ChatResponse(
-                response=json.dumps(result, indent=2, default=str),
-                sql_query=sql_query,
-                tools_used=["sql_generator", "database"],
-                execution_time=asyncio.get_event_loop().time() - start_time
+                response=llm_response,
+                session_id=session_id,
+                sql_query=None,
+                tools_used=["llm"],
+                execution_time=time.time() - start_time,
+                conversation_context_used=context_used
             )
         
     except Exception as e:
         logger.error(f"Chat error: {e}")
+        error_response = f"An error occurred: {str(e)}"
+        
+        # Still add to memory for debugging
+        if 'session_id' in locals():
+            conversation_memory.add_message(session_id, "assistant", error_response)
+        
         return ChatResponse(
-            response=f"An error occurred: {str(e)}",
+            response=error_response,
+            session_id=session_id if 'session_id' in locals() else str(uuid.uuid4()),
             tools_used=["error_handler"],
-            execution_time=asyncio.get_event_loop().time() - start_time
+            execution_time=time.time() - start_time,
+            conversation_context_used=False
         )
+
+@app.get("/conversation/{session_id}")
+async def get_conversation_history(session_id: str, last_n: int = 30):
+    """Get conversation history for a session"""
+    try:
+        history = conversation_memory.get_conversation_context(session_id, last_n)
+        return {
+            "session_id": session_id,
+            "messages": history,
+            "count": len(history)
+        }
+    except Exception as e:
+        logger.error(f"Error getting conversation history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/conversation/{session_id}")
+async def clear_conversation_history(session_id: str):
+    """Clear conversation history for a session"""
+    try:
+        if session_id in conversation_memory.conversations:
+            del conversation_memory.conversations[session_id]
+        return {"message": f"Conversation history cleared for session {session_id}"}
+    except Exception as e:
+        logger.error(f"Error clearing conversation history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    logger.info("/health endpoint called")
+    """Enhanced health check including FastMCP"""
     try:
-        # Test database
         db_healthy = await db_manager.test_connection()
         
-        # Test Mistral API
         mistral_healthy = True
         try:
             sql_generator.get_model()
         except Exception:
             mistral_healthy = False
         
-        # Overall status
+        fastmcp_healthy = mcp_manager.is_initialized
+        
         status = "healthy" if db_healthy and mistral_healthy else "degraded"
         
         return {
             "status": status,
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": time.time(),
             "components": {
                 "database": "healthy" if db_healthy else "unhealthy",
                 "mistral_api": "healthy" if mistral_healthy else "unhealthy",
-                "mcp_server": "optional"
+                "fastmcp": "healthy" if fastmcp_healthy else "unhealthy",
+                "conversation_memory": "healthy"
             },
-            "version": "2.0.0"
+            "memory_stats": {
+                "active_sessions": len(conversation_memory.conversations),
+                "total_messages": sum(len(conv) for conv in conversation_memory.conversations.values())
+            }
         }
-        
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": asyncio.get_event_loop().time()
+            "status": "error",
+            "timestamp": time.time(),
+            "error": str(e)
         }
+
+@app.post("/query")
+async def execute_direct_query(request: QueryRequest):
+    """Execute direct SQL query via FastMCP or database"""
+    try:
+        logger.info(f"Executing direct query: {request.query[:100]}...")
+        
+        # Try FastMCP first
+        result = await mcp_manager.execute_query(request.query)
+        
+        if "error" in result:
+            # Fallback to direct database execution
+            result = await db_manager.execute_query(request.query)
+        
+        return {
+            "success": "error" not in result,
+            "result": result,
+            "method": "fastmcp" if mcp_manager.is_initialized and "error" not in result else "direct"
+        }
+        
+    except Exception as e:
+        logger.error(f"Direct query error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tables")
 async def get_tables():
-    logger.info("/tables endpoint called")
+    """Get list of all tables via FastMCP"""
     try:
-        tables_result = await db_manager.list_tables()
-        if "error" in tables_result:
-            raise HTTPException(status_code=500, detail=tables_result["error"])
+        result = await mcp_manager.list_tables()
         
-        # Enrich with schema information
-        enriched_tables = []
-        for table in tables_result["tables"]:
-            table_name = table["table_name"]
-            schema_result = await db_manager.get_table_schema(table_name)
-            
-            enriched_table = {
-                "name": table_name,
-                "type": table["table_type"],
-                "columns": schema_result.get("columns", []) if "error" not in schema_result else []
-            }
-            enriched_tables.append(enriched_table)
+        if "error" in result:
+            # Fallback to direct database access
+            with db_manager.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT 
+                            table_name,
+                            COALESCE(obj_description(c.oid), 'No description') as table_comment
+                        FROM information_schema.tables t
+                        LEFT JOIN pg_class c ON c.relname = t.table_name
+                        WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                        ORDER BY t.table_name;
+                    """)
+                    tables = cursor.fetchall()
+                    
+                    result = {
+                        "tables": [dict(table) for table in tables],
+                        "count": len(tables)
+                    }
         
-        return {"tables": enriched_tables}
+        return result
         
     except Exception as e:
-        logger.error(f"Error getting tables: {e}")
+        logger.error(f"Get tables error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/table-schema/{table_name}")
+@app.get("/schema/{table_name}")
 async def get_table_schema_endpoint(table_name: str):
-    logger.info(f"/table-schema/{table_name} endpoint called")
+    """Get schema for specific table via FastMCP"""
     try:
-        result = await db_manager.get_table_schema(table_name)
+        result = await mcp_manager.get_table_schema(table_name)
+        
         if "error" in result:
-            raise HTTPException(status_code=404, detail=result["error"])
+            # Fallback to direct database access
+            with db_manager.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT 
+                            column_name, 
+                            data_type, 
+                            is_nullable, 
+                            column_default,
+                            character_maximum_length,
+                            numeric_precision,
+                            numeric_scale,
+                            ordinal_position
+                        FROM information_schema.columns
+                        WHERE table_name = %s AND table_schema = 'public'
+                        ORDER BY ordinal_position;
+                    """, (table_name,))
+                    columns = cursor.fetchall()
+                    
+                    if not columns:
+                        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+                    
+                    result = {
+                        "table_name": table_name,
+                        "columns": [dict(col) for col in columns]
+                    }
+        
         return result
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Schema retrieval error: {e}")
+        logger.error(f"Get table schema error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/execute-query")
-async def execute_query_endpoint(request: QueryRequest):
-    logger.info("/execute-query endpoint called")
+@app.get("/schema")
+async def get_full_schema_endpoint():
+    """Get full database schema via FastMCP"""
     try:
-        result = await db_manager.execute_query(request.query)
-        return {"result": result, "query": request.query}
+        result = await mcp_manager.get_full_schema()
+        
+        if "error" in result:
+            # Fallback to direct database access
+            schemas = await sql_generator._get_schemas_direct()
+            result = {"tables": schemas}
+        
+        return result
         
     except Exception as e:
-        logger.error(f"Query execution error: {e}")
+        logger.error(f"Get full schema error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/stats")
+async def get_system_stats():
+    """Get system statistics"""
+    try:
+        return {
+            "conversation_memory": {
+                "active_sessions": len(conversation_memory.conversations),
+                "total_messages": sum(len(conv) for conv in conversation_memory.conversations.values()),
+                "max_conversations": conversation_memory.max_conversations
+            },
+            "fastmcp": {
+                "initialized": mcp_manager.is_initialized,
+                "status": "healthy" if mcp_manager.is_initialized else "not_initialized"
+            },
+            "database": {
+                "connected": await db_manager.test_connection(),
+                "host": db_config.host,
+                "database": db_config.database,
+                "port": db_config.port
+            },
+            "cache": {
+                "schema_cache_size": len(sql_generator._schema_cache),
+                "last_cache_update": sql_generator._last_cache_update,
+                "cache_expiry": sql_generator._cache_expiry
+            }
+        }
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-def serve_frontend():
-    return FileResponse("chatbot_frontend.html")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "name": "Chatbot API with FastMCP",
+        "version": "3.0.0",
+        "description": "AI-powered chatbot with conversation memory and FastMCP for querying restaurant database",
+        "endpoints": {
+            "chat": "POST /chat - Main chat interface",
+            "health": "GET /health - Health check",
+            "tables": "GET /tables - List all tables",
+            "schema": "GET /schema - Get full schema",
+            "table_schema": "GET /schema/{table_name} - Get specific table schema",
+            "direct_query": "POST /query - Execute direct SQL query",
+            "conversation_history": "GET /conversation/{session_id} - Get conversation history",
+            "clear_conversation": "DELETE /conversation/{session_id} - Clear conversation history",
+            "stats": "GET /stats - System statistics"
+        },
+        "features": [
+            "Conversational AI with Mistral LLM",
+            "FastMCP integration for database tools",
+            "Conversation memory management",
+            "SQL query generation and validation",
+            "Database schema caching",
+            "Health monitoring"
+        ]
+    }
+
+# Additional utility endpoints for debugging
+@app.get("/debug/mcp-status")
+async def debug_mcp_status():
+    """Debug endpoint for FastMCP status"""
+    return {
+        "initialized": mcp_manager.is_initialized,
+        "mcp_instance": mcp_manager.mcp is not None,
+        "available_tools": list(mcp_manager.mcp._tools.keys()) if mcp_manager.mcp and hasattr(mcp_manager.mcp, '_tools') else []
+    }
+
+@app.get("/debug/memory/{session_id}")
+async def debug_session_memory(session_id: str):
+    """Debug endpoint for session memory"""
+    if session_id not in conversation_memory.conversations:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    messages = list(conversation_memory.conversations[session_id])
+    return {
+        "session_id": session_id,
+        "message_count": len(messages),
+        "messages": messages,
+        "formatted_context": conversation_memory.get_formatted_context(session_id)
+    }
+
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    return {"error": "Endpoint not found", "detail": str(exc)}
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    logger.error(f"Internal server error: {exc}")
+    return {"error": "Internal server error", "detail": "Please check the logs for more information"}
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Configuration
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
+    
+    logger.info(f"Starting server on {HOST}:{PORT}")
+    
     uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        access_log=True
+        "chatbot_api:app",
+        host=HOST,
+        port=PORT,
+        reload=os.getenv("ENVIRONMENT", "production") == "development",
+        log_level="info"
     )
