@@ -17,6 +17,7 @@ import json
 import threading
 import queue
 import re
+import asyncpg
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -169,20 +170,12 @@ class SimpleMCPClient:
 
 # Test database connection
 async def test_database_connection():
-    """Test database connection and log status"""
+    global db_pool
     try:
-        with psycopg2.connect(
-            host=env_vars["POSTGRES_HOST"],
-            database=env_vars["POSTGRES_DB"],
-            user=env_vars["POSTGRES_USER"],
-            password=env_vars["POSTGRES_PASSWORD"],
-            port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT version();")
-                version = cursor.fetchone()[0]
-                logger.info(f"✅ Database connection successful: {version}")
-                return True
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        logger.info("✅ Database connection successful")
+        return True
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
         return False
@@ -341,10 +334,21 @@ def is_database_related_query(message: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
+    global db_pool
     try:
         logger.info("🚀 Starting application...")
-        
-        # Test database connection on startup
+        # 1. Create the pool
+        db_pool = await asyncpg.create_pool(
+            host=env_vars["POSTGRES_HOST"],
+            database=env_vars["POSTGRES_DB"],
+            user=env_vars["POSTGRES_USER"],
+            password=env_vars["POSTGRES_PASSWORD"],
+            port=env_vars["POSTGRES_PORT"],
+            min_size=5,
+            max_size=10
+        )
+        logger.info("✅ asyncpg pool created")
+        # 2. Test the connection
         db_connected = await test_database_connection()
         if not db_connected:
             logger.error("❌ Database connection failed on startup")
@@ -357,29 +361,29 @@ async def lifespan(app: FastAPI):
             logger.warning("⚠️ MCP tools not available, using direct database access")
         
         logger.info("✅ Application startup completed")
-    except Exception as e:
-        logger.error(f"❌ Startup failed: {e}")
-    
-    yield
-    
-    logger.info("🛑 Application shutting down")
-    # Clean up MCP client and process
-    global mcp_client, mcp_process
-    if mcp_client:
-        try:
-            await mcp_client.aclose()
-        except Exception as e:
-            logger.error(f"Error closing MCP client: {e}")
-    if mcp_process:
-        try:
-            mcp_process.terminate()
-            mcp_process.wait(timeout=5)
-        except Exception as e:
-            logger.error(f"Error stopping MCP process: {e}")
+        yield
+    finally:
+        if db_pool:
+            await db_pool.close()
+            logger.info("🛑 asyncpg pool closed")
+        logger.info("🛑 Application shutting down")
+        # Clean up MCP client and process
+        global mcp_client, mcp_process
+        if mcp_client:
             try:
-                mcp_process.kill()
-            except:
-                pass
+                await mcp_client.aclose()
+            except Exception as e:
+                logger.error(f"Error closing MCP client: {e}")
+        if mcp_process:
+            try:
+                mcp_process.terminate()
+                mcp_process.wait(timeout=5)
+            except Exception as e:
+                logger.error(f"Error stopping MCP process: {e}")
+                try:
+                    mcp_process.kill()
+                except:
+                    pass
 
 app = FastAPI(title="MCP Chatbot API", version="1.0.0", lifespan=lifespan)
 
@@ -725,7 +729,7 @@ if __name__ == "__main__":
     
     logger.info("🚀 Starting FastAPI server...")
     uvicorn.run(
-        "ap:app",
+        ":app",
         host="127.0.0.1",
         port=8000,
         reload=True,

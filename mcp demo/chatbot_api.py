@@ -12,11 +12,12 @@ from dotenv import load_dotenv
 from langchain_mistralai import ChatMistralAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from contextlib import asynccontextmanager
-import psycopg2
 import json
 import threading
 import queue
 import re
+import datetime
+import asyncpg
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +53,18 @@ env_vars = validate_env_vars()
 # Global variables for MCP
 mcp_client = None
 mcp_process = None
+
+# At the top of chatbot_api.py
+schema_cache = {
+    "tables": [],
+    "schemas": {},
+    "last_updated": None
+}
+
+global_db_connection = None
+
+db_pool = None
+
 class SimpleMCPClient:
     """Simplified MCP client for Windows compatibility"""
     
@@ -262,19 +275,12 @@ class SimpleMCPClient:
 # Test database connection
 async def test_database_connection():
     """Test database connection and log status"""
+    global db_pool
     try:
-        with psycopg2.connect(
-            host=env_vars["POSTGRES_HOST"],
-            database=env_vars["POSTGRES_DB"],
-            user=env_vars["POSTGRES_USER"],
-            password=env_vars["POSTGRES_PASSWORD"],
-            port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT version();")
-                version = cursor.fetchone()[0]
-                logger.info(f"✅ Database connection successful: {version}")
-                return True
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        logger.info("✅ Database connection successful")
+        return True
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
         return False
@@ -282,40 +288,19 @@ async def test_database_connection():
 # Direct database functions as fallback
 async def execute_direct_query(query: str):
     """Execute a SQL query directly against the database"""
+    global db_pool
     try:
         logger.info(f"🔍 Executing direct query: {query[:100]}...")
-        
-        # Basic input validation
-        query = query.strip()
-        if not query:
+        if not query.strip():
             return {"error": "Empty query"}
-        
-        # FIXED: Only prevent dangerous operations that are NOT SELECT
-        query_upper = query.upper().strip()
-        if not query_upper.startswith('SELECT'):
-            dangerous_keywords = ['DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE', 'GRANT', 'REVOKE']
-            for keyword in dangerous_keywords:
-                if query_upper.startswith(keyword):
-                    return {"error": f"Operation not allowed: {keyword}"}
-        
-        with psycopg2.connect(
-            host=env_vars["POSTGRES_HOST"],
-            database=env_vars["POSTGRES_DB"],
-            user=env_vars["POSTGRES_USER"],
-            password=env_vars["POSTGRES_PASSWORD"],
-            port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-                if query.strip().upper().startswith('SELECT'):
-                    columns = [desc[0] for desc in cursor.description]
-                    rows = cursor.fetchall()
-                    logger.info(f"✅ Query executed successfully, returned {len(rows)} rows")
-                    return {"columns": columns, "rows": rows}
-                else:
-                    conn.commit()
-                    logger.info(f"✅ Query executed successfully, {cursor.rowcount} rows affected")
-                    return {"message": f"Query executed successfully. Rows affected: {cursor.rowcount}"}
+        if not query.strip().upper().startswith('SELECT'):
+            return {"error": "Only SELECT queries allowed"}
+
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(query)
+            columns = rows[0].keys() if rows else []
+            result_rows = [dict(row) for row in rows]
+            return {"columns": columns, "rows": result_rows}
     except Exception as e:
         logger.error(f"❌ Database query error: {e}")
         return {"error": str(e)}
@@ -323,22 +308,21 @@ async def execute_direct_query(query: str):
 async def get_table_schema_direct(table_name: str):
     """Get schema information for a table directly"""
     try:
-        with psycopg2.connect(
+        with asyncpg.create_pool(
             host=env_vars["POSTGRES_HOST"],
             database=env_vars["POSTGRES_DB"],
             user=env_vars["POSTGRES_USER"],
             password=env_vars["POSTGRES_PASSWORD"],
             port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
+        ) as pool:
+            async with pool.acquire() as conn:
+                columns = await conn.fetch("""
                     SELECT column_name, data_type, is_nullable, column_default
                     FROM information_schema.columns
-                    WHERE table_name = %s AND table_schema = 'public'
+                    WHERE table_name = $1 AND table_schema = 'public'
                     ORDER BY ordinal_position
-                """, (table_name,))
-                columns = cursor.fetchall()
-                return [{"name": col[0], "type": col[1], "nullable": col[2], "default": col[3]} for col in columns]
+                """, table_name)
+                return [{"name": col['column_name'], "type": col['data_type'], "nullable": col['is_nullable'], "default": col['column_default']} for col in columns]
     except Exception as e:
         return {"error": str(e)}
 
@@ -433,28 +417,39 @@ def is_database_related_query(message: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
+    global db_pool
     try:
         logger.info("🚀 Starting application...")
-        
+        # Create asyncpg pool with limits
+        db_pool = await asyncpg.create_pool(
+            host=env_vars["POSTGRES_HOST"],
+            database=env_vars["POSTGRES_DB"],
+            user=env_vars["POSTGRES_USER"],
+            password=env_vars["POSTGRES_PASSWORD"],
+            port=env_vars["POSTGRES_PORT"],
+            min_size=5,  # 5 idle connections
+            max_size=10  # 5 active + 5 idle = 10 total
+        )
+        logger.info("✅ asyncpg pool created")
         # Test database connection on startup
         db_connected = await test_database_connection()
         if not db_connected:
             logger.error("❌ Database connection failed on startup")
-        
         # Try to initialize MCP
         client = await get_mcp_client()
         if client:
             logger.info("✅ MCP tools initialized successfully")
+            await refresh_schema_cache(client)
         else:
             logger.warning("⚠️ MCP tools not available, using direct database access")
-        
         logger.info("✅ Application startup completed")
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
-    
     yield
-    
     logger.info("🛑 Application shutting down")
+    if db_pool:
+        await db_pool.close()
+        logger.info("🛑 asyncpg pool closed")
     # Clean up MCP client and process
     global mcp_client, mcp_process
     if mcp_client:
@@ -511,31 +506,29 @@ def get_mistral_model():
 async def get_all_table_schemas():
     """Fetch schema info for all tables in the public schema and return as a dict."""
     try:
-        with psycopg2.connect(
+        with asyncpg.create_pool(
             host=env_vars["POSTGRES_HOST"],
             database=env_vars["POSTGRES_DB"],
             user=env_vars["POSTGRES_USER"],
             password=env_vars["POSTGRES_PASSWORD"],
             port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
+        ) as pool:
+            async with pool.acquire() as conn:
+                tables = await conn.fetch("""
                     SELECT table_name 
                     FROM information_schema.tables 
                     WHERE table_schema = 'public'
                     ORDER BY table_name
                 """)
-                tables = [row[0] for row in cursor.fetchall()]
                 schema_info = {}
                 for table in tables:
-                    cursor.execute("""
+                    columns = await conn.fetch("""
                         SELECT column_name, data_type 
                         FROM information_schema.columns 
-                        WHERE table_name = %s AND table_schema = 'public' 
+                        WHERE table_name = $1 AND table_schema = 'public' 
                         ORDER BY ordinal_position
-                    """, (table,))
-                    columns = [f"{row[0]} ({row[1]})" for row in cursor.fetchall()]
-                    schema_info[table] = columns
+                    """, table['table_name'])
+                    schema_info[table['table_name']] = [f"{col['column_name']} ({col['data_type']})" for col in columns]
                 return schema_info
     except Exception as e:
         logger.error(f"Error getting table schemas: {e}")
@@ -600,35 +593,14 @@ async def general_chat_processing(request: ChatRequest):
 async def mcp_chat_processing(request: ChatRequest, client):
     """Chat processing using MCP tools"""
     try:
-        # Get table schemas using MCP
-        logger.info("📊 Getting table schemas via MCP")
-        tables_result = await client.call_tool("list_tables", {})
-        
-        # Handle different response formats
-        if isinstance(tables_result, dict):
-            if 'error' in tables_result:
-                logger.error(f"Error getting tables: {tables_result['error']}")
-                return await fallback_chat_processing(request)
-            
-            # Check if it's a direct result or wrapped in content
-            if 'content' in tables_result:
-                # Extract content from MCP response
-                content = tables_result['content']
-                if isinstance(content, list) and len(content) > 0:
-                    tables_data = json.loads(content[0]['text']) if content[0].get('text') else {}
-                else:
-                    tables_data = {}
-            else:
-                # Direct result
-                tables_data = tables_result
-        else:
-            logger.error(f"Unexpected tables result format: {type(tables_result)}")
-            return await fallback_chat_processing(request)
+        # Use the global cache
+        tables = schema_cache["tables"]
+        schemas = schema_cache["schemas"]
         
         # Build schema context
         schema_text = "Available tables:\n"
-        if isinstance(tables_data, dict) and 'tables' in tables_data:
-            for table in tables_data['tables']:
+        if isinstance(tables, dict) and 'tables' in tables:
+            for table in tables['tables']:
                 schema_result = await client.call_tool("get_table_schema", {"table_name": table['name']})
                 
                 if isinstance(schema_result, dict):
@@ -721,87 +693,6 @@ async def mcp_chat_processing(request: ChatRequest, client):
         logger.error(f"❌ MCP chat processing error: {e}")
         # Fallback to direct access
         return await fallback_chat_processing(request)
-    """Chat processing using MCP tools"""
-    try:
-        # Get table schemas using MCP
-        logger.info("📊 Getting table schemas via MCP")
-        tables_result = await client.call_tool("list_tables", {})
-        
-        if isinstance(tables_result, list) and len(tables_result) > 0:
-            tables_data = json.loads(tables_result[0].text) if hasattr(tables_result[0], 'text') else tables_result[0]
-        else:
-            tables_data = tables_result
-        
-        # Build schema context
-        schema_text = "Available tables:\n"
-        if isinstance(tables_data, dict) and 'tables' in tables_data:
-            for table in tables_data['tables']:
-                schema_result = await client.call_tool("get_table_schema", {"table_name": table['name']})
-                if isinstance(schema_result, list) and len(schema_result) > 0:
-                    schema_data = json.loads(schema_result[0].text) if hasattr(schema_result[0], 'text') else schema_result[0]
-                    if isinstance(schema_data, dict) and 'columns' in schema_data:
-                        columns = [f"{col['name']} ({col['type']})" for col in schema_data['columns']]
-                        schema_text += f"{table['name']}: {', '.join(columns)}\n"
-        
-        # Generate SQL using AI
-        model = get_mistral_model()
-        improved_prompt = (
-            "You are an expert SQL assistant for a PostgreSQL database. "
-            "Your job is to convert user requests into a single, safe, syntactically correct SQL SELECT query.\n"
-            "- Only generate SELECT statements. Never use DROP, DELETE, TRUNCATE, ALTER, CREATE, INSERT, or UPDATE.\n"
-            f"- Use the following table schemas:\n{schema_text}\n"
-            "- Do NOT use Markdown formatting or code blocks. Only output the SQL statement, nothing else.\n"
-            "- If the user asks for something not possible with a SELECT, reply: 'Operation not allowed.'\n"
-            "- Use only the columns and tables provided.\n"
-            f"User request: {request.message}"
-        )
-        
-        sql_response = await model.ainvoke([HumanMessage(content=improved_prompt)])
-        sql_query = sql_response.content.strip().split('\n')[0]
-        sql_query = sql_query.replace('\\_', '_').replace('\\', '')
-        
-        if sql_query == "Operation not allowed.":
-            return ChatResponse(response="Operation not allowed.", tools_used=["mcp_tools"])
-        
-        # Execute query using MCP
-        logger.info(f"🔍 Executing SQL via MCP: {sql_query}")
-        query_result = await client.call_tool("execute_query", {"query": sql_query})
-        
-        if isinstance(query_result, list) and len(query_result) > 0:
-            result_data = json.loads(query_result[0].text) if hasattr(query_result[0], 'text') else query_result[0]
-        else:
-            result_data = query_result
-        
-        # Format response
-        if isinstance(result_data, dict):
-            if 'error' in result_data:
-                return ChatResponse(
-                    response=f"Generated SQL: {sql_query}\n\nError: {result_data['error']}",
-                    tools_used=["mcp_tools"]
-                )
-            elif 'results' in result_data:
-                formatted_result = f"Query Results:\nRows returned: {result_data.get('row_count', 0)}\n"
-                if result_data['results']:
-                    formatted_result += "Data:\n"
-                    for i, row in enumerate(result_data['results'][:10]):
-                        formatted_result += f"  {i+1}. {row}\n"
-                    if len(result_data['results']) > 10:
-                        formatted_result += f"  ... and {len(result_data['results']) - 10} more rows\n"
-                
-                return ChatResponse(
-                    response=f"SQL Query: {sql_query}\n\n{formatted_result}",
-                    tools_used=["mcp_tools"]
-                )
-        
-        return ChatResponse(
-            response=f"SQL Query: {sql_query}\n\nResult: {str(result_data)}",
-            tools_used=["mcp_tools"]
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ MCP chat processing error: {e}")
-        # Fallback to direct access
-        return await fallback_chat_processing(request)
 
 async def fallback_chat_processing(request: ChatRequest):
     """Chat processing using direct database access"""
@@ -867,21 +758,20 @@ async def get_tables():
     try:
         logger.info("📋 Getting tables from database")
         
-        with psycopg2.connect(
+        with asyncpg.create_pool(
             host=env_vars["POSTGRES_HOST"],
             database=env_vars["POSTGRES_DB"],
             user=env_vars["POSTGRES_USER"],
             password=env_vars["POSTGRES_PASSWORD"],
             port=env_vars["POSTGRES_PORT"]
-        ) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
+        ) as pool:
+            async with pool.acquire() as conn:
+                tables = await conn.fetch("""
                     SELECT table_name, table_type
                     FROM information_schema.tables 
                     WHERE table_schema = 'public'
                     ORDER BY table_name
                 """)
-                tables = [{"name": row[0], "type": row[1]} for row in cursor.fetchall()]
                 
         logger.info(f"✅ Found {len(tables)} tables")
         return {"tables": tables, "count": len(tables)}
@@ -927,6 +817,82 @@ async def execute_query(request: QueryRequest):
     except Exception as e:
         logger.error(f"❌ Query execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Query execution error: {str(e)}")
+
+async def refresh_schema_cache(client):
+    global schema_cache
+    # Fetch tables and schemas (via MCP or direct DB)
+    tables_result = await client.call_tool("list_tables", {})
+    # Handle different response formats
+    if isinstance(tables_result, dict):
+        if 'error' in tables_result:
+            logger.error(f"Error getting tables: {tables_result['error']}")
+            return
+        if 'content' in tables_result:
+            content = tables_result['content']
+            if isinstance(content, list) and len(content) > 0:
+                tables_data = json.loads(content[0]['text']) if content[0].get('text') else {}
+            else:
+                tables_data = {}
+        else:
+            tables_data = tables_result
+    else:
+        logger.error(f"Unexpected tables result format: {type(tables_result)}")
+        return
+    tables = tables_data.get("tables", []) if isinstance(tables_data, dict) else []
+    schemas = {}
+    for table in tables:
+        schema_result = await client.call_tool("get_table_schema", {"table_name": table['name']})
+        if isinstance(schema_result, dict):
+            if 'error' in schema_result:
+                continue
+            if 'content' in schema_result:
+                content = schema_result['content']
+                if isinstance(content, list) and len(content) > 0:
+                    schema_data = json.loads(content[0]['text']) if content[0].get('text') else {}
+                else:
+                    schema_data = {}
+            else:
+                schema_data = schema_result
+            schemas[table['name']] = schema_data
+    schema_cache = {
+        "tables": tables,
+        "schemas": schemas,
+        "last_updated": datetime.datetime.utcnow().isoformat()
+    }
+    logger.info(f"✅ Schema cache refreshed at {schema_cache['last_updated']}")
+
+async def schema_refresh_task():
+    while True:
+        await refresh_schema_cache(await get_mcp_client())
+        await asyncio.sleep(60 * 10)  # Refresh every 10 minutes
+
+# In your lifespan or startup event:
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(schema_refresh_task())
+
+@app.post("/refresh_schema")
+async def manual_refresh():
+    await refresh_schema_cache(await get_mcp_client())
+    return {"status": "refreshed", "last_updated": schema_cache["last_updated"]}
+
+def get_global_db_connection():
+    global global_db_connection
+    try:
+        # If connection does not exist or is closed, create a new one
+        if global_db_connection is None or global_db_connection.closed:
+            global_db_connection = asyncpg.create_pool(
+                host=env_vars["POSTGRES_HOST"],
+                database=env_vars["POSTGRES_DB"],
+                user=env_vars["POSTGRES_USER"],
+                password=env_vars["POSTGRES_PASSWORD"],
+                port=env_vars["POSTGRES_PORT"]
+            )
+        return global_db_connection
+    except Exception as e:
+        logger.error(f"Error getting global DB connection: {e}")
+        global_db_connection = None
+        raise
 
 if __name__ == "__main__":
     import uvicorn

@@ -17,6 +17,7 @@ import json
 import threading
 import queue
 import re
+import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +53,14 @@ env_vars = validate_env_vars()
 # Global variables for MCP
 mcp_client = None
 mcp_process = None
+
+# At the top of chatbot_api.py
+schema_cache = {
+    "tables": [],
+    "schemas": {},
+    "last_updated": None
+}
+
 class SimpleMCPClient:
     """Simplified MCP client for Windows compatibility"""
     
@@ -721,87 +730,6 @@ async def mcp_chat_processing(request: ChatRequest, client):
         logger.error(f"❌ MCP chat processing error: {e}")
         # Fallback to direct access
         return await fallback_chat_processing(request)
-    """Chat processing using MCP tools"""
-    try:
-        # Get table schemas using MCP
-        logger.info("📊 Getting table schemas via MCP")
-        tables_result = await client.call_tool("list_tables", {})
-        
-        if isinstance(tables_result, list) and len(tables_result) > 0:
-            tables_data = json.loads(tables_result[0].text) if hasattr(tables_result[0], 'text') else tables_result[0]
-        else:
-            tables_data = tables_result
-        
-        # Build schema context
-        schema_text = "Available tables:\n"
-        if isinstance(tables_data, dict) and 'tables' in tables_data:
-            for table in tables_data['tables']:
-                schema_result = await client.call_tool("get_table_schema", {"table_name": table['name']})
-                if isinstance(schema_result, list) and len(schema_result) > 0:
-                    schema_data = json.loads(schema_result[0].text) if hasattr(schema_result[0], 'text') else schema_result[0]
-                    if isinstance(schema_data, dict) and 'columns' in schema_data:
-                        columns = [f"{col['name']} ({col['type']})" for col in schema_data['columns']]
-                        schema_text += f"{table['name']}: {', '.join(columns)}\n"
-        
-        # Generate SQL using AI
-        model = get_mistral_model()
-        improved_prompt = (
-            "You are an expert SQL assistant for a PostgreSQL database. "
-            "Your job is to convert user requests into a single, safe, syntactically correct SQL SELECT query.\n"
-            "- Only generate SELECT statements. Never use DROP, DELETE, TRUNCATE, ALTER, CREATE, INSERT, or UPDATE.\n"
-            f"- Use the following table schemas:\n{schema_text}\n"
-            "- Do NOT use Markdown formatting or code blocks. Only output the SQL statement, nothing else.\n"
-            "- If the user asks for something not possible with a SELECT, reply: 'Operation not allowed.'\n"
-            "- Use only the columns and tables provided.\n"
-            f"User request: {request.message}"
-        )
-        
-        sql_response = await model.ainvoke([HumanMessage(content=improved_prompt)])
-        sql_query = sql_response.content.strip().split('\n')[0]
-        sql_query = sql_query.replace('\\_', '_').replace('\\', '')
-        
-        if sql_query == "Operation not allowed.":
-            return ChatResponse(response="Operation not allowed.", tools_used=["mcp_tools"])
-        
-        # Execute query using MCP
-        logger.info(f"🔍 Executing SQL via MCP: {sql_query}")
-        query_result = await client.call_tool("execute_query", {"query": sql_query})
-        
-        if isinstance(query_result, list) and len(query_result) > 0:
-            result_data = json.loads(query_result[0].text) if hasattr(query_result[0], 'text') else query_result[0]
-        else:
-            result_data = query_result
-        
-        # Format response
-        if isinstance(result_data, dict):
-            if 'error' in result_data:
-                return ChatResponse(
-                    response=f"Generated SQL: {sql_query}\n\nError: {result_data['error']}",
-                    tools_used=["mcp_tools"]
-                )
-            elif 'results' in result_data:
-                formatted_result = f"Query Results:\nRows returned: {result_data.get('row_count', 0)}\n"
-                if result_data['results']:
-                    formatted_result += "Data:\n"
-                    for i, row in enumerate(result_data['results'][:10]):
-                        formatted_result += f"  {i+1}. {row}\n"
-                    if len(result_data['results']) > 10:
-                        formatted_result += f"  ... and {len(result_data['results']) - 10} more rows\n"
-                
-                return ChatResponse(
-                    response=f"SQL Query: {sql_query}\n\n{formatted_result}",
-                    tools_used=["mcp_tools"]
-                )
-        
-        return ChatResponse(
-            response=f"SQL Query: {sql_query}\n\nResult: {str(result_data)}",
-            tools_used=["mcp_tools"]
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ MCP chat processing error: {e}")
-        # Fallback to direct access
-        return await fallback_chat_processing(request)
 
 async def fallback_chat_processing(request: ChatRequest):
     """Chat processing using direct database access"""
@@ -927,6 +855,34 @@ async def execute_query(request: QueryRequest):
     except Exception as e:
         logger.error(f"❌ Query execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Query execution error: {str(e)}")
+
+async def refresh_schema_cache():
+    global schema_cache
+    # Fetch tables and schemas (via MCP or direct DB)
+    tables = await ...  # list_tables
+    schemas = {}
+    for table in tables:
+        schemas[table['name']] = await ...  # get_table_schema
+    schema_cache = {
+        "tables": tables,
+        "schemas": schemas,
+        "last_updated": datetime.datetime.utcnow()
+    }
+
+async def schema_refresh_task():
+    while True:
+        await refresh_schema_cache()
+        await asyncio.sleep(60 * 10)  # Refresh every 10 minutes
+
+# In your lifespan or startup event:
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(schema_refresh_task())
+
+@app.post("/refresh_schema")
+async def manual_refresh():
+    await refresh_schema_cache()
+    return {"status": "refreshed", "last_updated": schema_cache["last_updated"]}
 
 if __name__ == "__main__":
     import uvicorn
