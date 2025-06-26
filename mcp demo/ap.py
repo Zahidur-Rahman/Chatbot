@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Windows-compatible MCP Server for PostgreSQL database operations.
+This server provides tools for executing SQL queries and managing database schema.
+"""
+
 import asyncio
 import json
 import logging
@@ -9,7 +15,6 @@ from typing import Any, Dict, List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-import traceback
 
 # MCP imports
 from mcp.server import Server
@@ -45,9 +50,6 @@ DB_CONFIG = {
     "password": os.getenv("POSTGRES_PASSWORD", "postgres"),
     "port": int(os.getenv("POSTGRES_PORT", "5432"))
 }
-
-class DummyNotificationOptions:
-    tools_changed = None
 
 class PostgreSQLServer:
     """PostgreSQL MCP Server implementation"""
@@ -131,83 +133,6 @@ class PostgreSQLServer:
                 return [TextContent(type="text", text=f"Error: {str(e)}")]
     
     async def _execute_query(self, query: str) -> str:
-        """Execute a SQL query with security checks"""
-        try:
-            # Input validation
-            query = query.strip()
-            if not query:
-                return json.dumps({"error": "Empty query provided"})
-            
-            # Security check - only allow SELECT statements
-            if not query.upper().startswith('SELECT'):
-                return json.dumps({
-                    "error": "Only SELECT queries are allowed for security reasons",
-                    "provided_query": query[:100] + "..." if len(query) > 100 else query
-                })
-            
-            # Check for dangerous patterns
-            dangerous_patterns = [
-                'DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE',
-                'GRANT', 'REVOKE', 'COPY', 'CALL', 'EXECUTE'
-            ]
-            
-            query_upper = query.upper()
-            for pattern in dangerous_patterns:
-                if pattern in query_upper:
-                    return json.dumps({
-                        "error": f"Query contains forbidden keyword: {pattern}",
-                        "provided_query": query[:100] + "..." if len(query) > 100 else query
-                    })
-            
-            # Execute query synchronously for Windows compatibility
-            conn = self.get_db_connection()
-            try:
-                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(query)
-                    results = cursor.fetchall()
-                    
-                    # Convert to JSON-serializable format
-                    json_results = []
-                    for row in results:
-                        json_row = {}
-                        for key, value in row.items():
-                            # Handle special types that aren't JSON serializable
-                            if hasattr(value, 'isoformat'):  # datetime objects
-                                json_row[key] = value.isoformat()
-                            elif isinstance(value, (bytes, memoryview)):
-                                json_row[key] = str(value)
-                            elif hasattr(value, '__class__') and value.__class__.__name__ == 'Decimal':
-                                # Handle Decimal objects from PostgreSQL NUMERIC/DECIMAL columns
-                                json_row[key] = float(value)
-                            elif isinstance(value, (int, float, str, bool, type(None))):
-                                # Basic JSON-serializable types
-                                json_row[key] = value
-                            else:
-                                # Fallback for any other non-serializable types
-                                json_row[key] = str(value)
-                        json_results.append(json_row)
-                    
-                    return json.dumps({
-                        "success": True,
-                        "query": query,
-                        "row_count": len(json_results),
-                        "results": json_results
-                    }, indent=2)
-            finally:
-                conn.close()
-                    
-        except psycopg2.Error as e:
-            logger.error(f"Database error: {e}")
-            return json.dumps({
-                "error": f"Database error: {str(e)}",
-                "query": query[:100] + "..." if len(query) > 100 else query
-            })
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            return json.dumps({
-                "error": f"Unexpected error: {str(e)}",
-                "query": query[:100] + "..." if len(query) > 100 else query
-            })
         """Execute a SQL query with security checks"""
         try:
             # Input validation
@@ -379,7 +304,10 @@ async def main():
                 InitializationOptions(
                     server_name="postgres-server",
                     server_version="1.0.0",
-                    capabilities=postgres_server.server.get_capabilities(DummyNotificationOptions(), {}),
+                    capabilities=postgres_server.server.get_capabilities(
+                        notification_options=None,
+                        experimental_capabilities=None,
+                    ),
                 ),
             )
             
@@ -388,7 +316,6 @@ async def main():
         sys.exit(1)
     except Exception as e:
         logger.error(f"Server error: {e}")
-        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":

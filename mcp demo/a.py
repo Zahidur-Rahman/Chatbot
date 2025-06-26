@@ -52,6 +52,7 @@ env_vars = validate_env_vars()
 # Global variables for MCP
 mcp_client = None
 mcp_process = None
+
 class SimpleMCPClient:
     """Simplified MCP client for Windows compatibility"""
     
@@ -67,59 +68,6 @@ class SimpleMCPClient:
         self._response_queue = queue.Queue()
         self._communication_thread = None
         self._start_communication_thread()
-        self._initialized = False
-        self._initialize_server()
-    
-    def _initialize_server(self):
-        """Initialize the MCP server with proper handshake"""
-        try:
-            # Send initialization request
-            init_message = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "clientInfo": {
-                        "name": "fastapi-client",
-                        "version": "1.0.0"
-                    }
-                }
-            }
-            
-            init_str = json.dumps(init_message) + "\n"
-            self.process.stdin.write(init_str)
-            self.process.stdin.flush()
-            
-            # Wait for initialization response
-            response_line = self.process.stdout.readline()
-            if response_line:
-                try:
-                    response = json.loads(response_line.strip())
-                    if response.get("id") == 1 and "result" in response:
-                        logger.info("✅ MCP server initialized successfully")
-                        self._initialized = True
-                        
-                        # Send initialized notification
-                        initialized_notification = {
-                            "jsonrpc": "2.0",
-                            "method": "notifications/initialized"
-                        }
-                        notif_str = json.dumps(initialized_notification) + "\n"
-                        self.process.stdin.write(notif_str)
-                        self.process.stdin.flush()
-                    else:
-                        logger.error(f"Initialization failed: {response}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse initialization response: {e}")
-            else:
-                logger.error("No initialization response received")
-                
-        except Exception as e:
-            logger.error(f"Initialization error: {e}")
     
     def _start_communication_thread(self):
         """Start a background thread to handle MCP communication"""
@@ -167,49 +115,10 @@ class SimpleMCPClient:
         self._communication_thread.start()
     
     async def get_tools(self):
-        """Get available tools from the MCP server"""
-        if not self._initialized:
-            return self.tools
-            
-        try:
-            self._message_id += 1
-            message = {
-                "jsonrpc": "2.0",
-                "id": self._message_id,
-                "method": "tools/list"
-            }
-            
-            # Send request
-            self._request_queue.put(message)
-            
-            # Wait for response with timeout
-            timeout = 10
-            start_time = time.time()
-            
-            while time.time() - start_time < timeout:
-                try:
-                    response = self._response_queue.get(timeout=1)
-                    if response.get("id") == self._message_id:
-                        if "result" in response:
-                            return response["result"].get("tools", self.tools)
-                        elif "error" in response:
-                            logger.error(f"Tools list error: {response['error']}")
-                            return self.tools
-                except queue.Empty:
-                    continue
-            
-            logger.warning("Tools list request timeout")
-            return self.tools
-            
-        except Exception as e:
-            logger.error(f"Error getting tools: {e}")
-            return self.tools
+        return self.tools
     
     async def call_tool(self, tool_name: str, arguments: dict):
         """Call a tool on the MCP server"""
-        if not self._initialized:
-            return {"error": "MCP server not initialized"}
-            
         try:
             self._message_id += 1
             message = {
@@ -232,11 +141,10 @@ class SimpleMCPClient:
             while time.time() - start_time < timeout:
                 try:
                     response = self._response_queue.get(timeout=1)
-                    if response.get("id") == self._message_id:
-                        if "result" in response:
-                            return response["result"]
-                        elif "error" in response:
-                            return {"error": response["error"]}
+                    if "result" in response:
+                        return response["result"]
+                    elif "error" in response:
+                        return {"error": response["error"]}
                 except queue.Empty:
                     continue
             
@@ -478,7 +386,7 @@ app = FastAPI(title="MCP Chatbot API", version="1.0.0", lifespan=lifespan)
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -598,129 +506,6 @@ async def general_chat_processing(request: ChatRequest):
         )
 
 async def mcp_chat_processing(request: ChatRequest, client):
-    """Chat processing using MCP tools"""
-    try:
-        # Get table schemas using MCP
-        logger.info("📊 Getting table schemas via MCP")
-        tables_result = await client.call_tool("list_tables", {})
-        
-        # Handle different response formats
-        if isinstance(tables_result, dict):
-            if 'error' in tables_result:
-                logger.error(f"Error getting tables: {tables_result['error']}")
-                return await fallback_chat_processing(request)
-            
-            # Check if it's a direct result or wrapped in content
-            if 'content' in tables_result:
-                # Extract content from MCP response
-                content = tables_result['content']
-                if isinstance(content, list) and len(content) > 0:
-                    tables_data = json.loads(content[0]['text']) if content[0].get('text') else {}
-                else:
-                    tables_data = {}
-            else:
-                # Direct result
-                tables_data = tables_result
-        else:
-            logger.error(f"Unexpected tables result format: {type(tables_result)}")
-            return await fallback_chat_processing(request)
-        
-        # Build schema context
-        schema_text = "Available tables:\n"
-        if isinstance(tables_data, dict) and 'tables' in tables_data:
-            for table in tables_data['tables']:
-                schema_result = await client.call_tool("get_table_schema", {"table_name": table['name']})
-                
-                if isinstance(schema_result, dict):
-                    if 'error' in schema_result:
-                        continue
-                    
-                    # Handle schema response format
-                    if 'content' in schema_result:
-                        content = schema_result['content']
-                        if isinstance(content, list) and len(content) > 0:
-                            schema_data = json.loads(content[0]['text']) if content[0].get('text') else {}
-                        else:
-                            schema_data = {}
-                    else:
-                        schema_data = schema_result
-                    
-                    if isinstance(schema_data, dict) and 'columns' in schema_data:
-                        columns = [f"{col['name']} ({col['type']})" for col in schema_data['columns']]
-                        schema_text += f"{table['name']}: {', '.join(columns)}\n"
-        
-        # Generate SQL using AI
-        model = get_mistral_model()
-        improved_prompt = (
-            "You are an expert SQL assistant for a PostgreSQL database. "
-            "Your job is to convert user requests into a single, safe, syntactically correct SQL SELECT query.\n"
-            "- Only generate SELECT statements. Never use DROP, DELETE, TRUNCATE, ALTER, CREATE, INSERT, or UPDATE.\n"
-            f"- Use the following table schemas:\n{schema_text}\n"
-            "- Do NOT use Markdown formatting or code blocks. Only output the SQL statement, nothing else.\n"
-            "- If the user asks for something not possible with a SELECT, reply: 'Operation not allowed.'\n"
-            "- Use only the columns and tables provided.\n"
-            f"User request: {request.message}"
-        )
-        
-        sql_response = await model.ainvoke([HumanMessage(content=improved_prompt)])
-        sql_query = sql_response.content.strip().split('\n')[0]
-        sql_query = sql_query.replace('\\_', '_').replace('\\', '')
-        
-        if sql_query == "Operation not allowed.":
-            return ChatResponse(response="Operation not allowed.", tools_used=["mcp_tools"])
-        
-        # Execute query using MCP
-        logger.info(f"🔍 Executing SQL via MCP: {sql_query}")
-        query_result = await client.call_tool("execute_query", {"query": sql_query})
-        
-        # Handle query result
-        if isinstance(query_result, dict):
-            if 'error' in query_result:
-                return ChatResponse(
-                    response=f"Generated SQL: {sql_query}\n\nError: {query_result['error']}",
-                    tools_used=["mcp_tools"]
-                )
-            
-            # Handle different response formats
-            if 'content' in query_result:
-                content = query_result['content']
-                if isinstance(content, list) and len(content) > 0:
-                    result_data = json.loads(content[0]['text']) if content[0].get('text') else {}
-                else:
-                    result_data = {}
-            else:
-                result_data = query_result
-            
-            # Format response
-            if isinstance(result_data, dict):
-                if 'error' in result_data:
-                    return ChatResponse(
-                        response=f"Generated SQL: {sql_query}\n\nError: {result_data['error']}",
-                        tools_used=["mcp_tools"]
-                    )
-                elif 'results' in result_data:
-                    formatted_result = f"Query Results:\nRows returned: {result_data.get('row_count', 0)}\n"
-                    if result_data['results']:
-                        formatted_result += "Data:\n"
-                        for i, row in enumerate(result_data['results'][:10]):
-                            formatted_result += f"  {i+1}. {row}\n"
-                        if len(result_data['results']) > 10:
-                            formatted_result += f"  ... and {len(result_data['results']) - 10} more rows\n"
-                    
-                    return ChatResponse(
-                        response=f"SQL Query: {sql_query}\n\n{formatted_result}",
-                        tools_used=["mcp_tools"]
-                    )
-        
-        return ChatResponse(
-            response=f"SQL Query: {sql_query}\n\nResult: {str(query_result)}",
-            tools_used=["mcp_tools"]
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ MCP chat processing error: {e}")
-        # Fallback to direct access
-        return await fallback_chat_processing(request)
     """Chat processing using MCP tools"""
     try:
         # Get table schemas using MCP
@@ -940,7 +725,7 @@ if __name__ == "__main__":
     
     logger.info("🚀 Starting FastAPI server...")
     uvicorn.run(
-        "chatbot_api:app",
+        "ap:app",
         host="127.0.0.1",
         port=8000,
         reload=True,
